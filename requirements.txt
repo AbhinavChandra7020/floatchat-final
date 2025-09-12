@@ -1,0 +1,12 @@
+certifi==2025.8.3
+cftime==1.6.4.post1
+netCDF4==1.7.2
+numpy==2.3.3
+packaging==25.0
+pandas==2.3.2
+psycopg2-binary==2.9.10
+python-dateutil==2.9.0.post0
+pytz==2025.2
+six==1.17.0
+tzdata==2025.2
+xarray==2025.9.0
