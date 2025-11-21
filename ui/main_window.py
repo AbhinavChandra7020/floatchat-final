@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 import json
 import re
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import sql
 
 # Load environment variables
 load_dotenv()
@@ -31,85 +34,270 @@ def configure_gemini():
         return None
     
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+    model = genai.GenerativeModel('gemini-flash-latest')
     return model
 
-@st.cache_data
-def generate_hardcoded_argo_data():
-    """Generate realistic ARGO float data for different regions"""
-    np.random.seed(42)
-    random.seed(42)
+# Database connection
+@st.cache_resource
+def get_db_connection():
+    """Create PostgreSQL database connection"""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('DB_HOST'),
+            database=os.getenv('DB_NAME'),
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            port=os.getenv('DB_PORT', 5432)
+        )
+        return conn
+    except Exception as e:
+        st.error(f"Database connection failed: {str(e)}")
+        return None
+
+def execute_query(query, params=None):
+    """Execute SQL query and return results as DataFrame"""
+    conn = get_db_connection()
+    if not conn:
+        return pd.DataFrame()
     
-    # Define regions with realistic ARGO float distributions
-    regions = {
-        'indian_ocean': {
-            'lat_range': (-40, 25), 'lon_range': (20, 120),
-            'count': 800, 'temp_range': (2, 32)
-        },
-        'arabian_sea': {
-            'lat_range': (8, 27), 'lon_range': (60, 78),
-            'count': 150, 'temp_range': (22, 32)
-        },
-        'bay_of_bengal': {
-            'lat_range': (5, 22), 'lon_range': (80, 100),
-            'count': 120, 'temp_range': (24, 31)
-        },
-        'southern_ocean': {
-            'lat_range': (-60, -40), 'lon_range': (20, 120),
-            'count': 200, 'temp_range': (-2, 8)
-        },
-        'equatorial_indian': {
-            'lat_range': (-10, 10), 'lon_range': (50, 100),
-            'count': 180, 'temp_range': (25, 30)
-        }
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if params:
+                cur.execute(query, params)
+            else:
+                cur.execute(query)
+            
+            results = cur.fetchall()
+            df = pd.DataFrame(results)
+            return df
+    except Exception as e:
+        st.error(f"Query execution failed: {str(e)}")
+        return pd.DataFrame()
+    finally:
+        conn.commit()
+
+def get_database_schema():
+    """Get database schema information for Gemini"""
+    schema_query = """
+    SELECT 
+        column_name, 
+        data_type, 
+        is_nullable
+    FROM 
+        information_schema.columns
+    WHERE 
+        table_name = 'argo_profiles'
+    ORDER BY 
+        ordinal_position;
+    """
+    
+    schema_df = execute_query(schema_query)
+    return schema_df
+
+def get_data_summary():
+    """Get summary statistics from database"""
+    summary_queries = {
+        'total_profiles': "SELECT COUNT(*) as count FROM argo_profiles",
+        'total_platforms': "SELECT COUNT(DISTINCT platform_number) as count FROM argo_profiles",
+        'date_range': """
+            SELECT 
+                MIN(juld) as min_date, 
+                MAX(juld) as max_date 
+            FROM argo_profiles
+            WHERE juld IS NOT NULL
+        """,
+        'data_centres': "SELECT DISTINCT data_centre FROM argo_profiles WHERE data_centre IS NOT NULL",
+        'platform_types': "SELECT DISTINCT platform_type FROM argo_profiles WHERE platform_type IS NOT NULL"
     }
     
-    all_data = []
-    float_id = 1000
+    summary = {}
     
-    for region, params in regions.items():
-        for i in range(params['count']):
-            # Generate random coordinates within region
-            lat = np.random.uniform(params['lat_range'][0], params['lat_range'][1])
-            lon = np.random.uniform(params['lon_range'][0], params['lon_range'][1])
-            
-            # Generate realistic oceanographic data
-            depth_levels = np.random.choice([10, 50, 100, 200, 500, 1000, 2000], 
-                                          size=np.random.randint(3, 8))
-            
-            for depth in depth_levels:
-                # Temperature decreases with depth
-                surface_temp = np.random.uniform(params['temp_range'][0], params['temp_range'][1])
-                temp = surface_temp * np.exp(-depth/1000) if depth > 100 else surface_temp
-                temp = max(temp, 2)  # Ocean minimum temperature
-                
-                # Salinity (typical ocean values)
-                salinity = np.random.uniform(34.5, 37.5)
-                if region == 'bay_of_bengal':
-                    salinity = np.random.uniform(33.0, 35.0)  # Lower due to freshwater input
-                
-                # Pressure increases with depth
-                pressure = depth * 1.02  # Approximate dbar conversion
-                
-                # Random recent dates
-                days_ago = np.random.randint(0, 365)
-                date_time = datetime.now() - timedelta(days=days_ago)
-                
-                all_data.append({
-                    'id': f"ARGO_{float_id}",
-                    'latitude': round(lat, 4),
-                    'longitude': round(lon, 4),
-                    'date_time': date_time,
-                    'temperature': round(temp, 2),
-                    'salinity': round(salinity, 3),
-                    'pressure': round(pressure, 1),
-                    'depth': depth,
-                    'region': region
-                })
-            
-            float_id += 1
+    for key, query in summary_queries.items():
+        result = execute_query(query)
+        if not result.empty:
+            if key == 'total_profiles' or key == 'total_platforms':
+                summary[key] = int(result.iloc[0]['count'])
+            elif key == 'date_range':
+                min_date = result.iloc[0]['min_date']
+                max_date = result.iloc[0]['max_date']
+                summary[key] = f"{min_date} to {max_date}"
+            elif key in ['data_centres', 'platform_types']:
+                summary[key] = result.iloc[:, 0].tolist()
     
-    return pd.DataFrame(all_data)
+    return summary
+
+def create_gemini_sql_prompt(user_query, schema_info, data_summary):
+    """Create a prompt for Gemini to generate SQL query"""
+    
+    schema_description = "\n".join([
+        f"- {row['column_name']}: {row['data_type']}" 
+        for _, row in schema_info.iterrows()
+    ])
+    
+    prompt = f"""
+You are an expert SQL query generator for oceanographic ARGO float profile data stored in PostgreSQL.
+
+DATABASE SCHEMA (table name: argo_profiles):
+{schema_description}
+
+COLUMN DESCRIPTIONS:
+- id: Primary key
+- platform_number: ARGO float platform identifier
+- cycle_number: Profile cycle number
+- direction: Profile direction (A=Ascending, D=Descending)
+- data_centre: Data collection centre code
+- dc_reference: Data centre reference
+- data_state_indicator: Quality state of data
+- data_mode: Data mode (R=Real-time, D=Delayed, A=Adjusted)
+- platform_type: Type of platform/float
+- float_serial_no: Serial number of the float
+- firmware_version: Firmware version
+- wmo_inst_type: WMO instrument type
+- project_name: Project name
+- pi_name: Principal Investigator name
+- juld: Julian date (main timestamp)
+- juld_qc: Quality control for julian date
+- juld_location: Julian date of location
+- latitude: Latitude coordinate
+- longitude: Longitude coordinate
+- position_qc: Position quality control
+- positioning_system: GPS/positioning system used
+- profile_pres_qc: Profile pressure quality control
+- profile_temp_qc: Profile temperature quality control
+- profile_psal_qc: Profile salinity quality control
+- vertical_sampling_scheme: Vertical sampling method
+- config_mission_number: Configuration mission number
+- description: Profile description
+- embedding: Vector embedding (ignore for queries)
+
+DATASET CONTEXT:
+- Total profiles: {data_summary.get('total_profiles', 'N/A')}
+- Total platforms: {data_summary.get('total_platforms', 'N/A')}
+- Date range: {data_summary.get('date_range', 'N/A')}
+- Available data centres: {', '.join(data_summary.get('data_centres', [])[:5])}
+- Platform types: {', '.join(data_summary.get('platform_types', [])[:5])}
+
+IMPORTANT SQL GUIDELINES:
+- Table name is 'argo_profiles'
+- Always use proper PostgreSQL syntax
+- Use LIMIT clause to prevent overwhelming results (default LIMIT 200)
+- For count queries, use COUNT() aggregation
+- Date filtering should use 'juld' column (Julian date timestamp)
+- Location uses 'latitude' and 'longitude' columns
+- Platform identification uses 'platform_number' column
+- Use 'data_centre' for filtering by data collection centre
+- Use 'platform_type' for filtering by float type
+- Quality control columns end with '_qc'
+- Use ORDER BY for sorting results
+- Always return relevant columns for display
+- Do NOT query the 'embedding' column as it's for vector operations only
+
+USER QUERY: "{user_query}"
+
+Please analyze this query and return a JSON response with the following structure:
+{{
+    "query_type": "count|profile|data_filter|temporal|general|aggregate|platform",
+    "intent": "Brief description of what user wants",
+    "sql_query": "SELECT ... FROM argo_profiles WHERE ... ORDER BY ... LIMIT ...",
+    "response_message": "Natural language response explaining what data will be shown",
+    "visualization_type": "map|chart|table|summary",
+    "region_focus": null
+}}
+
+EXAMPLE INTERPRETATIONS:
+- "Show profiles from platform 1901234" → 
+  sql_query: "SELECT id, platform_number, cycle_number, latitude, longitude, juld, data_centre FROM argo_profiles WHERE platform_number = '1901234' ORDER BY juld DESC LIMIT 200"
+  
+- "How many profiles are there?" → 
+  sql_query: "SELECT COUNT(*) as total_profiles FROM argo_profiles"
+  
+- "Show recent profiles from 2024" → 
+  sql_query: "SELECT id, platform_number, latitude, longitude, juld, data_centre, platform_type FROM argo_profiles WHERE EXTRACT(YEAR FROM juld) = 2024 ORDER BY juld DESC LIMIT 200"
+  
+- "Find profiles in Arabian Sea region" → 
+  sql_query: "SELECT id, platform_number, latitude, longitude, juld, data_centre FROM argo_profiles WHERE latitude BETWEEN 8 AND 27 AND longitude BETWEEN 60 AND 78 ORDER BY juld DESC LIMIT 200"
+
+- "Count profiles by data centre" → 
+  sql_query: "SELECT data_centre, COUNT(*) as profile_count FROM argo_profiles GROUP BY data_centre ORDER BY profile_count DESC"
+
+- "Show profiles with good quality position data" → 
+  sql_query: "SELECT id, platform_number, latitude, longitude, juld, position_qc FROM argo_profiles WHERE position_qc = '1' ORDER BY juld DESC LIMIT 200"
+
+- "List all platform types" →
+  sql_query: "SELECT DISTINCT platform_type, COUNT(*) as count FROM argo_profiles GROUP BY platform_type ORDER BY count DESC"
+
+- "Recent ascending profiles" →
+  sql_query: "SELECT id, platform_number, cycle_number, direction, latitude, longitude, juld FROM argo_profiles WHERE direction = 'A' ORDER BY juld DESC LIMIT 200"
+
+- "Profiles from Indian Ocean" →
+  sql_query: "SELECT id, platform_number, latitude, longitude, juld, data_centre FROM argo_profiles WHERE latitude BETWEEN -40 AND 25 AND longitude BETWEEN 20 AND 120 ORDER BY juld DESC LIMIT 200"
+
+Return ONLY the JSON response, no additional text or code blocks.
+"""
+    return prompt
+
+def query_gemini_for_sql(model, user_query, schema_info, data_summary):
+    """Query Gemini to generate SQL query"""
+    try:
+        prompt = create_gemini_sql_prompt(user_query, schema_info, data_summary)
+        response = model.generate_content(prompt)
+        
+        # Extract JSON from response
+        response_text = response.text.strip()
+        
+        # Try to extract JSON if wrapped in code blocks
+        if "```json" in response_text:
+            json_match = re.search(r'```json\n(.*?)\n```', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(1)
+        elif "```" in response_text:
+            json_match = re.search(r'```\n(.*?)\n```', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(1)
+        
+        # Parse JSON
+        parsed_response = json.loads(response_text)
+        return parsed_response
+        
+    except Exception as e:
+        st.error(f"Error querying Gemini: {str(e)}")
+        # Fallback response
+        return {
+            "query_type": "general",
+            "intent": "Show general data",
+            "sql_query": "SELECT id, platform_number, latitude, longitude, juld, data_centre FROM argo_profiles ORDER BY juld DESC LIMIT 100",
+            "response_message": f"Showing general ARGO profile data. (Note: AI processing failed, using fallback)",
+            "visualization_type": "table",
+            "region_focus": None
+        }
+
+def validate_sql_query(sql_query):
+    """Basic SQL injection prevention and validation"""
+    # Convert to lowercase for checking
+    query_lower = sql_query.lower()
+    
+    # Blocked keywords (SQL injection prevention)
+    blocked_keywords = [
+        'drop', 'delete', 'truncate', 'insert', 'update',
+        'alter', 'create', 'grant', 'revoke', '--', ';--'
+    ]
+    
+    for keyword in blocked_keywords:
+        if keyword in query_lower:
+            st.error(f"Query contains blocked keyword: {keyword}")
+            return False
+    
+    # Must be a SELECT query
+    if not query_lower.strip().startswith('select'):
+        st.error("Only SELECT queries are allowed")
+        return False
+    
+    # Must reference argo_profiles table
+    if 'argo_profiles' not in query_lower:
+        st.error("Query must reference argo_profiles table")
+        return False
+    
+    return True
 
 def get_region_bounds(region):
     """Get bounding box for different ocean regions"""
@@ -147,178 +335,6 @@ def get_region_bounds(region):
     }
     return regions.get(region, None)
 
-def create_gemini_prompt(user_query, data_summary):
-    """Create a structured prompt for Gemini to understand the query"""
-    prompt = f"""
-You are an expert oceanographic data analyst working with ARGO float data from the Indian Ocean region. 
-Your task is to interpret user queries and return structured JSON responses for data filtering.
-
-DATASET CONTEXT:
-- Total ARGO floats: {data_summary['total_floats']}
-- Total measurements: {data_summary['total_records']}
-- Date range: {data_summary['date_range']}
-- Available regions: Indian Ocean, Arabian Sea, Bay of Bengal, Southern Ocean, Equatorial Indian Ocean
-- Available measurements: temperature, salinity, pressure, depth, latitude, longitude, date_time
-
-USER QUERY: "{user_query}"
-
-Please analyze this query and return a JSON response with the following structure:
-{{
-    "query_type": "count|regional|data_filter|temporal|general",
-    "intent": "Brief description of what user wants",
-    "filters": {{
-        "region": "indian_ocean|arabian_sea|bay_of_bengal|southern_ocean|equatorial_indian|null",
-        "temperature_range": {{"min": number, "max": number}} or null,
-        "depth_range": {{"min": number, "max": number}} or null,
-        "salinity_range": {{"min": number, "max": number}} or null,
-        "pressure_range": {{"min": number, "max": number}} or null,
-        "date_filter": {{"type": "recent|year|range", "value": "value"}} or null,
-        "coordinate_bounds": {{"lat_min": number, "lat_max": number, "lon_min": number, "lon_max": number}} or null
-    }},
-    "sort_by": "temperature|salinity|pressure|depth|date_time|null",
-    "sort_order": "asc|desc",
-    "limit": number (default 200),
-    "response_message": "Natural language response to user explaining what data will be shown"
-}}
-
-EXAMPLE INTERPRETATIONS:
-- "Show floats in Arabian Sea" → region: "arabian_sea", query_type: "regional"
-- "High temperature readings" → temperature_range: {{"min": 25, "max": null}}, query_type: "data_filter"
-- "Deep water measurements" → depth_range: {{"min": 500, "max": null}}, query_type: "data_filter"
-- "Recent data from 2024" → date_filter: {{"type": "year", "value": "2024"}}, query_type: "temporal"
-- "How many floats" → query_type: "count"
-
-Return ONLY the JSON response, no additional text.
-"""
-    return prompt
-
-def query_gemini(model, user_query, data_summary):
-    """Query Gemini for intelligent data filtering"""
-    try:
-        prompt = create_gemini_prompt(user_query, data_summary)
-        response = model.generate_content(prompt)
-        
-        # Extract JSON from response
-        response_text = response.text.strip()
-        
-        # Try to extract JSON if wrapped in code blocks
-        if "```json" in response_text:
-            json_match = re.search(r'```json\n(.*?)\n```', response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(1)
-        elif "```" in response_text:
-            json_match = re.search(r'```\n(.*?)\n```', response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(1)
-        
-        # Parse JSON
-        parsed_response = json.loads(response_text)
-        return parsed_response
-        
-    except Exception as e:
-        st.error(f"Error querying Gemini: {str(e)}")
-        # Fallback response
-        return {
-            "query_type": "general",
-            "intent": "Show general data",
-            "filters": {},
-            "sort_by": None,
-            "sort_order": "desc",
-            "limit": 100,
-            "response_message": f"Showing general ARGO float data. (Note: AI processing failed, using fallback)"
-        }
-
-def apply_gemini_filters(df, gemini_response):
-    """Apply filters based on Gemini's interpretation"""
-    filtered_df = df.copy()
-    region = None
-    
-    filters = gemini_response.get('filters', {})
-    
-    # Handle count queries
-    if gemini_response.get('query_type') == 'count':
-        total_floats = df['id'].nunique()
-        return pd.DataFrame({'total_floats': [total_floats]}), None
-    
-    # Regional filter
-    if filters.get('region'):
-        region = filters['region']
-        region_info = get_region_bounds(region)
-        if region_info:
-            bounds = region_info['bounds']
-            filtered_df = filtered_df[
-                (filtered_df['latitude'] >= bounds['lat_min']) & 
-                (filtered_df['latitude'] <= bounds['lat_max']) &
-                (filtered_df['longitude'] >= bounds['lon_min']) & 
-                (filtered_df['longitude'] <= bounds['lon_max'])
-            ]
-    
-    # Temperature filter
-    temp_range = filters.get('temperature_range')
-    if temp_range:
-        if temp_range.get('min') is not None:
-            filtered_df = filtered_df[filtered_df['temperature'] >= temp_range['min']]
-        if temp_range.get('max') is not None:
-            filtered_df = filtered_df[filtered_df['temperature'] <= temp_range['max']]
-    
-    # Depth filter
-    depth_range = filters.get('depth_range')
-    if depth_range:
-        if depth_range.get('min') is not None:
-            filtered_df = filtered_df[filtered_df['depth'] >= depth_range['min']]
-        if depth_range.get('max') is not None:
-            filtered_df = filtered_df[filtered_df['depth'] <= depth_range['max']]
-    
-    # Salinity filter
-    salinity_range = filters.get('salinity_range')
-    if salinity_range:
-        if salinity_range.get('min') is not None:
-            filtered_df = filtered_df[filtered_df['salinity'] >= salinity_range['min']]
-        if salinity_range.get('max') is not None:
-            filtered_df = filtered_df[filtered_df['salinity'] <= salinity_range['max']]
-    
-    # Pressure filter
-    pressure_range = filters.get('pressure_range')
-    if pressure_range:
-        if pressure_range.get('min') is not None:
-            filtered_df = filtered_df[filtered_df['pressure'] >= pressure_range['min']]
-        if pressure_range.get('max') is not None:
-            filtered_df = filtered_df[filtered_df['pressure'] <= pressure_range['max']]
-    
-    # Date filter
-    date_filter = filters.get('date_filter')
-    if date_filter:
-        if date_filter.get('type') == 'recent':
-            days_back = 30
-            cutoff_date = datetime.now() - timedelta(days=days_back)
-            filtered_df = filtered_df[filtered_df['date_time'] >= cutoff_date]
-        elif date_filter.get('type') == 'year':
-            year = int(date_filter.get('value', datetime.now().year))
-            filtered_df = filtered_df[filtered_df['date_time'].dt.year == year]
-    
-    # Coordinate bounds filter
-    coord_bounds = filters.get('coordinate_bounds')
-    if coord_bounds:
-        filtered_df = filtered_df[
-            (filtered_df['latitude'] >= coord_bounds['lat_min']) & 
-            (filtered_df['latitude'] <= coord_bounds['lat_max']) &
-            (filtered_df['longitude'] >= coord_bounds['lon_min']) & 
-            (filtered_df['longitude'] <= coord_bounds['lon_max'])
-        ]
-    
-    # Sorting
-    sort_by = gemini_response.get('sort_by')
-    sort_order = gemini_response.get('sort_order', 'desc')
-    if sort_by and sort_by in filtered_df.columns:
-        ascending = sort_order == 'asc'
-        filtered_df = filtered_df.sort_values(sort_by, ascending=ascending)
-    
-    # Limit results
-    limit = gemini_response.get('limit', 200)
-    filtered_df = filtered_df.head(limit)
-    
-    return filtered_df, region
-
 def create_enhanced_map(df, region=None):
     """Create map with optional region highlighting"""
     if df.empty or 'latitude' not in df.columns or 'longitude' not in df.columns:
@@ -347,36 +363,41 @@ def create_enhanced_map(df, region=None):
     # Add ARGO float data points
     hover_text = []
     for idx, row in df.iterrows():
-        text = f"Float ID: {row.get('id', 'N/A')}<br>"
-        text += f"Date: {row.get('date_time', 'N/A')}<br>"
+        text = f"Platform: {row.get('platform_number', 'N/A')}<br>"
+        if 'cycle_number' in row:
+            text += f"Cycle: {row.get('cycle_number', 'N/A')}<br>"
+        text += f"Date: {row.get('juld', 'N/A')}<br>"
         text += f"Lat: {row.get('latitude', 'N/A'):.3f}<br>"
         text += f"Lon: {row.get('longitude', 'N/A'):.3f}<br>"
-        if 'temperature' in row and pd.notna(row['temperature']):
-            text += f"Temperature: {row['temperature']:.2f}°C<br>"
-        if 'salinity' in row and pd.notna(row['salinity']):
-            text += f"Salinity: {row['salinity']:.3f} PSU<br>"
-        if 'pressure' in row and pd.notna(row['pressure']):
-            text += f"Pressure: {row['pressure']:.1f} dbar<br>"
-        if 'depth' in row and pd.notna(row['depth']):
-            text += f"Depth: {row['depth']} m"
+        if 'data_centre' in row:
+            text += f"Data Centre: {row.get('data_centre', 'N/A')}<br>"
+        if 'platform_type' in row:
+            text += f"Platform Type: {row.get('platform_type', 'N/A')}<br>"
+        if 'direction' in row:
+            text += f"Direction: {row.get('direction', 'N/A')}"
         hover_text.append(text)
     
-    # Color points by temperature if available
-    if 'temperature' in df.columns and df['temperature'].notna().any():
+    # Color points by data centre or platform if available
+    if 'data_centre' in df.columns and df['data_centre'].notna().any():
+        # Create color mapping for data centres
+        unique_centres = df['data_centre'].unique()
+        color_map = {centre: idx for idx, centre in enumerate(unique_centres)}
+        colors = [color_map[centre] if pd.notna(centre) else -1 for centre in df['data_centre']]
+        
         fig.add_trace(go.Scattermapbox(
             lat=df['latitude'],
             lon=df['longitude'],
             mode='markers',
             marker=dict(
                 size=8,
-                color=df['temperature'],
+                color=colors,
                 colorscale='Viridis',
                 showscale=True,
-                colorbar=dict(title="Temperature (°C)")
+                colorbar=dict(title="Data Centre")
             ),
             text=hover_text,
             hoverinfo='text',
-            name='ARGO Floats'
+            name='ARGO Profiles'
         ))
     else:
         fig.add_trace(go.Scattermapbox(
@@ -386,15 +407,21 @@ def create_enhanced_map(df, region=None):
             marker=dict(size=6, color='blue'),
             text=hover_text,
             hoverinfo='text',
-            name='ARGO Floats'
+            name='ARGO Profiles'
         ))
     
-    # Set map layout
+    # Set map layout - FIXED THIS SECTION
     if region:
         region_info = get_region_bounds(region)
-        center_lat = region_info['center']['lat']
-        center_lon = region_info['center']['lon']
-        zoom = region_info['zoom']
+        if region_info:  # Check if region_info is not None
+            center_lat = region_info['center']['lat']
+            center_lon = region_info['center']['lon']
+            zoom = region_info['zoom']
+        else:
+            # Fallback to data-based center if region not found
+            center_lat = df['latitude'].mean()
+            center_lon = df['longitude'].mean()
+            zoom = 2
     else:
         center_lat = df['latitude'].mean()
         center_lon = df['longitude'].mean()
@@ -413,13 +440,8 @@ def create_enhanced_map(df, region=None):
     
     return fig
 
-# Load data
-@st.cache_data
-def load_data():
-    return generate_hardcoded_argo_data()
-
 # Main app
-st.title("🌊 INCOIS ARGO Float Data Explorer")
+st.title("🌊 INCOIS ARGO Float Profile Explorer")
 st.markdown("**AI-Powered Oceanographic Data Analysis** - Ask questions in natural language!")
 
 # Initialize Gemini
@@ -427,21 +449,23 @@ gemini_model = configure_gemini()
 if not gemini_model:
     st.stop()
 
-# Load the dataset
-with st.spinner("Loading ARGO float dataset..."):
-    argo_data = load_data()
+# Test database connection
+conn = get_db_connection()
+if not conn:
+    st.error("Failed to connect to database. Please check your .env configuration.")
+    st.stop()
+else:
+    st.success("✅ Connected to PostgreSQL database")
 
-total_floats = argo_data['id'].nunique()
-total_records = len(argo_data)
-date_range = f"{argo_data['date_time'].min().strftime('%Y-%m-%d')} to {argo_data['date_time'].max().strftime('%Y-%m-%d')}"
+# Get database schema and summary
+with st.spinner("Loading database schema and summary..."):
+    schema_info = get_database_schema()
+    data_summary = get_data_summary()
 
-data_summary = {
-    'total_floats': total_floats,
-    'total_records': total_records,
-    'date_range': date_range
-}
-
-st.success(f"🤖 AI-Enhanced system loaded with {total_floats:,} ARGO floats and {total_records:,} measurements")
+if not schema_info.empty:
+    st.success(f"🤖 AI-Enhanced system connected to database with {data_summary.get('total_platforms', 0):,} ARGO platforms and {data_summary.get('total_profiles', 0):,} profiles")
+else:
+    st.warning("Database schema could not be loaded. Please ensure the 'argo_profiles' table exists.")
 
 # Quick action buttons
 st.subheader("Quick Queries")
@@ -450,204 +474,243 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.markdown("**Regional Queries:**")
-    if st.button("Indian Ocean Floats", use_container_width=True):
-        st.session_state.query = "Show me all ARGO floats in the Indian Ocean"
+    if st.button("Indian Ocean Profiles", use_container_width=True):
+        st.session_state.query = "Show me profiles from the Indian Ocean"
     
     if st.button("Arabian Sea", use_container_width=True):
-        st.session_state.query = "Find floats in the Arabian Sea region"
+        st.session_state.query = "Find profiles in the Arabian Sea region"
     
     if st.button("Bay of Bengal", use_container_width=True):
-        st.session_state.query = "Show data from Bay of Bengal"
+        st.session_state.query = "Show profiles from Bay of Bengal"
 
 with col2:
     st.markdown("**Data Analysis:**")
-    if st.button("High Temperature Waters", use_container_width=True):
-        st.session_state.query = "Show me areas with high water temperature"
+    if st.button("Recent Profiles", use_container_width=True):
+        st.session_state.query = "Show me the most recent profiles from 2024"
     
-    if st.button("Total Float Count", use_container_width=True):
-        st.session_state.query = "How many ARGO floats are in the dataset?"
+    if st.button("Profile Count", use_container_width=True):
+        st.session_state.query = "How many profiles are in the database?"
     
-    if st.button("Recent Measurements", use_container_width=True):
-        st.session_state.query = "Show me the most recent data"
+    if st.button("Platform Types", use_container_width=True):
+        st.session_state.query = "Show me all platform types and their counts"
 
 # Add separator
 st.markdown("---")
 
 # Enhanced chat interface
 st.subheader("AI Chat Interface")
-st.markdown("*Ask questions about ARGO floats in natural language - the AI will understand and filter the data accordingly*")
+st.markdown("*Ask questions about ARGO profiles in natural language - the AI will generate SQL queries automatically*")
 
 # Example queries
 with st.expander("Example Queries", expanded=False):
     st.markdown("""
     **Try these natural language queries:**
-    - "Show me warm water areas above 28°C in the Arabian Sea"
-    - "Find deep measurements below 1000 meters from 2024"
-    - "What's the average salinity in Bay of Bengal?"
-    - "Show recent data from the equatorial region"
-    - "Find floats with low salinity readings"
-    - "Display temperature patterns in Southern Ocean"
+    - "Show profiles from platform 2902746"
+    - "Find recent profiles from Arabian Sea"
+    - "How many profiles by data centre?"
+    - "Show ascending profiles from 2024"
+    - "List all profiles with good position quality"
+    - "What platform types are available?"
+    - "Show profiles from Indian Ocean in last 6 months"
+    - "Count profiles by direction"
     """)
 
 user_query = st.text_input(
-    "Ask about ARGO floats:", 
+    "Ask about ARGO profiles:", 
     value=st.session_state.get('query', ''),
-    placeholder="e.g., Show me warm water areas in the Indian Ocean with temperature above 25°C"
+    placeholder="e.g., Show me recent profiles from the Arabian Sea"
 )
 
 if user_query:
     st.markdown(f"**Your Query:** *{user_query}*")
     
-    # Process query with Gemini
-    with st.spinner("AI is analyzing your query..."):
-        gemini_response = query_gemini(gemini_model, user_query, data_summary)
+    # Process query with Gemini to generate SQL
+    with st.spinner("🤖 AI is generating SQL query..."):
+        gemini_response = query_gemini_for_sql(gemini_model, user_query, schema_info, data_summary)
     
-    # Show AI interpretation
-    with st.expander("AI Query Interpretation", expanded=False):
+    # Show AI interpretation and generated SQL
+    with st.expander("AI Query Interpretation & Generated SQL", expanded=True):
         st.json(gemini_response)
+        st.code(gemini_response.get('sql_query', ''), language='sql')
     
-    # Apply filters based on Gemini's interpretation
-    with st.spinner("🔍 Filtering data based on AI analysis..."):
-        results, region = apply_gemini_filters(argo_data, gemini_response)
+    # Validate and execute SQL query
+    sql_query = gemini_response.get('sql_query', '')
     
-    # Show AI response message
-    if gemini_response.get('response_message'):
-        st.info(f"**AI Response:** {gemini_response['response_message']}")
-    
-    if not results.empty:
-        # Handle count queries differently
-        if 'total_floats' in results.columns:
-            st.success(f"**Total ARGO floats in dataset: {results.iloc[0]['total_floats']:,}**")
-        else:
-            # Show results summary
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Records Found", len(results))
-            with col2:
-                if 'temperature' in results.columns and results['temperature'].notna().any():
-                    avg_temp = results['temperature'].mean()
-                    st.metric("Avg Temperature", f"{avg_temp:.2f}°C")
-            with col3:
-                if 'salinity' in results.columns and results['salinity'].notna().any():
-                    avg_salinity = results['salinity'].mean()
-                    st.metric("Avg Salinity", f"{avg_salinity:.2f} PSU")
-            with col4:
-                if 'date_time' in results.columns:
-                    latest_date = results['date_time'].max()
-                    st.metric("Latest Record", str(latest_date)[:10])
+    if validate_sql_query(sql_query):
+        with st.spinner("🔍 Executing SQL query on database..."):
+            results = execute_query(sql_query)
+        
+        # Show AI response message
+        if gemini_response.get('response_message'):
+            st.info(f"**AI Response:** {gemini_response['response_message']}")
+        
+        if not results.empty:
+            # Check if this is an aggregate query
+            is_aggregate = any(col in results.columns for col in ['count', 'total_profiles', 'profile_count', 'avg', 'sum', 'min', 'max'])
             
-            # Show data table
-            st.subheader("Filtered Results")
-            display_columns = ['id', 'latitude', 'longitude', 'date_time', 'temperature', 'salinity', 'depth']
-            display_df = results[display_columns].copy()
-            display_df['date_time'] = display_df['date_time'].dt.strftime('%Y-%m-%d %H:%M')
-            st.dataframe(
-                display_df, 
-                use_container_width=True,
-                height=300
-            )
-            
-            # Create enhanced map
-            if 'latitude' in results.columns and 'longitude' in results.columns:
-                st.subheader("🗺️ Interactive Map Visualization")
-                if region:
-                    region_name = get_region_bounds(region)['name']
-                    st.success(f"**Focused Region:** {region_name} (highlighted in red)")
+            if is_aggregate:
+                # Display aggregate results
+                st.subheader("📊 Query Results")
                 
-                fig = create_enhanced_map(results, region)
-                if fig:
-                    st.plotly_chart(
-                        fig, 
-                        use_container_width=True,
-                        config={
-                            'displayModeBar': True,
-                            'displaylogo': False,
-                            'modeBarButtonsToRemove': ['select2d', 'lasso2d'],
-                            'toImageButtonOptions': {
-                                'format': 'png',
-                                'filename': 'argo_floats_map',
-                                'height': 600,
-                                'width': 1200,
-                                'scale': 2
-                            },
-                            'scrollZoom': True,
-                            'doubleClick': 'reset'
-                        }
-                    )
+                if len(results) == 1:
+                    # Single result metrics
+                    cols = st.columns(len(results.columns))
+                    for idx, col in enumerate(results.columns):
+                        with cols[idx]:
+                            value = results.iloc[0][col]
+                            if isinstance(value, (int, float)):
+                                st.metric(col.replace('_', ' ').title(), f"{value:,.0f}")
+                            else:
+                                st.metric(col.replace('_', ' ').title(), value)
+                else:
+                    # Multiple rows table
+                    st.dataframe(results, use_container_width=True, height=400)
             
-            # Enhanced analytics
-            if len(results) > 1:
-                st.subheader("Quick Analytics")
+            else:
+                # Show results summary for regular queries
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Records Found", len(results))
+                with col2:
+                    if 'platform_number' in results.columns:
+                        unique_platforms = results['platform_number'].nunique()
+                        st.metric("Unique Platforms", unique_platforms)
+                with col3:
+                    if 'data_centre' in results.columns and results['data_centre'].notna().any():
+                        unique_centres = results['data_centre'].nunique()
+                        st.metric("Data Centres", unique_centres)
+                with col4:
+                    if 'juld' in results.columns:
+                        latest_date = pd.to_datetime(results['juld']).max()
+                        st.metric("Latest Profile", str(latest_date)[:10])
                 
-                # Temperature distribution
-                if 'temperature' in results.columns and results['temperature'].notna().any():
+                # Show data table
+                st.subheader("Filtered Results")
+                display_columns = [col for col in ['id', 'platform_number', 'cycle_number', 'latitude', 'longitude', 'juld', 'data_centre', 'platform_type', 'direction'] if col in results.columns]
+                display_df = results[display_columns].copy()
+                
+                if 'juld' in display_df.columns:
+                    display_df['juld'] = pd.to_datetime(display_df['juld']).dt.strftime('%Y-%m-%d %H:%M')
+                
+                st.dataframe(
+                    display_df, 
+                    use_container_width=True,
+                    height=300
+                )
+                
+                # Create enhanced map if geographic data is present
+                
+        if 'latitude' in results.columns and 'longitude' in results.columns:
+            st.subheader("🗺️ Interactive Map Visualization")
+            
+            region_focus = gemini_response.get('region_focus')
+            if region_focus:
+                region_info = get_region_bounds(region_focus)
+                if region_info:  # Only show success message if region is valid
+                    st.success(f"**Focused Region:** {region_info['name']} (highlighted in red)")
+            
+            fig = create_enhanced_map(results, region_focus)
+            if fig:
+                st.plotly_chart(
+                    fig, 
+                    use_container_width=True,
+                    config={
+                        'displayModeBar': True,
+                        'displaylogo': False,
+                        'modeBarButtonsToRemove': ['select2d', 'lasso2d'],
+                        'toImageButtonOptions': {
+                            'format': 'png',
+                            'filename': 'argo_profiles_map',
+                            'height': 600,
+                            'width': 1200,
+                            'scale': 2
+                        },
+                        'scrollZoom': True,
+                        'doubleClick': 'reset'
+                    }
+                )
+                
+                # Enhanced analytics
+                if len(results) > 1:
+                    st.subheader("Quick Analytics")
+                    
                     col1, col2 = st.columns(2)
                     
                     with col1:
-                        fig_temp = px.histogram(
-                            results, 
-                            x='temperature', 
-                            nbins=20,
-                            title='Temperature Distribution',
-                            labels={'temperature': 'Temperature (°C)', 'count': 'Frequency'}
-                        )
-                        fig_temp.update_layout(height=300)
-                        st.plotly_chart(fig_temp, use_container_width=True)
+                        # Platform distribution
+                        if 'platform_number' in results.columns:
+                            platform_counts = results['platform_number'].value_counts().head(10)
+                            fig_platforms = px.bar(
+                                x=platform_counts.index,
+                                y=platform_counts.values,
+                                title='Top 10 Platforms by Profile Count',
+                                labels={'x': 'Platform Number', 'y': 'Profile Count'}
+                            )
+                            fig_platforms.update_layout(height=300)
+                            st.plotly_chart(fig_platforms, use_container_width=True)
                     
                     with col2:
-                        if 'depth' in results.columns and results['depth'].notna().any():
-                            fig_depth = px.scatter(
-                                results, 
-                                x='temperature', 
-                                y='depth',
-                                color='salinity',
-                                title='Temperature vs Depth Profile',
-                                labels={'temperature': 'Temperature (°C)', 'depth': 'Depth (m)'}
+                        # Data centre distribution
+                        if 'data_centre' in results.columns and results['data_centre'].notna().any():
+                            centre_counts = results['data_centre'].value_counts()
+                            fig_centres = px.pie(
+                                values=centre_counts.values,
+                                names=centre_counts.index,
+                                title='Distribution by Data Centre'
                             )
-                            fig_depth.update_yaxis(autorange="reversed")  # Depth increases downward
-                            fig_depth.update_layout(height=300)
-                            st.plotly_chart(fig_depth, use_container_width=True)
-            
-            # Download option
-            csv = results.to_csv(index=False)
-            st.download_button(
-                label="Download Results as CSV",
-                data=csv,
-                file_name=f"argo_floats_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-    
+                            fig_centres.update_layout(height=300)
+                            st.plotly_chart(fig_centres, use_container_width=True)
+                
+                # Download option
+                csv = results.to_csv(index=False)
+                st.download_button(
+                    label="Download Results as CSV",
+                    data=csv,
+                    file_name=f"argo_profiles_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+        
+        else:
+            st.warning("No results found for your query. Try rephrasing or broadening your search terms.")
     else:
-        st.warning("No results found for your query. Try rephrasing or broadening your search terms.")
+        st.error("❌ SQL query validation failed. This may be due to security restrictions or invalid query structure.")
 
 # Clear session state query after use
 if 'query' in st.session_state:
     del st.session_state.query
 
 # Enhanced sidebar with AI features
-st.sidebar.header("AI-Enhanced Features")
+st.sidebar.header("🤖 AI-Enhanced Features")
 st.sidebar.markdown("""
-**Natural Language Processing:**
+**Natural Language to SQL:**
 - Intelligent query interpretation
-- Context-aware data filtering  
+- Automatic SQL generation
+- Security validation
 - Multi-parameter analysis
 - Smart region detection
 
 **Query Examples:**
-- "Warm waters above 25°C"
-- "Deep measurements in Arabian Sea"
-- "Recent salinity data from 2024"
-- "Temperature patterns near equator"
-- "Count floats by region"
+- "Profiles from platform X"
+- "Recent data from Arabian Sea"
+- "Count by data centre"
+- "Ascending profiles from 2024"
+- "Platform types available"
 """)
 
-st.sidebar.header("Dataset Information")
-st.sidebar.markdown(f"""
-**Current Dataset:**
-- **Total Floats:** {total_floats:,}
-- **Measurements:** {total_records:,}
-- **Date Range:** {date_range}
-- **Regions:** 5 ocean areas
-- **Parameters:** Temp, Salinity, Depth, Pressure
-""")
+st.sidebar.header("📊 Dataset Information")
+if data_summary:
+    st.sidebar.markdown(f"""
+    **Current Dataset:**
+    - **Total Profiles:** {data_summary.get('total_profiles', 'N/A'):,}
+    - **Total Platforms:** {data_summary.get('total_platforms', 'N/A'):,}
+    - **Date Range:** {data_summary.get('date_range', 'N/A')}
+    - **Data Centres:** {len(data_summary.get('data_centres', []))} centres
+    - **Platform Types:** {len(data_summary.get('platform_types', []))} types
+    """)
+
+
+st.sidebar.header("🔍 Available Columns")
+if not schema_info.empty:
+    with st.sidebar.expander("View Schema"):
+        st.dataframe(schema_info[['column_name', 'data_type']], use_container_width=True)
